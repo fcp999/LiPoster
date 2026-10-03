@@ -8,7 +8,7 @@ A small, single-user LinkedIn text-post scheduler. It publishes directly through
 - LinkedIn OAuth 2.0
 - Automatic `#NetScout` suffix
 - SQLite audit trail
-- Exponential retry for transient failures
+- Duplicate-safe failure handling for ambiguous POST results
 - Browser interface and bearer-token REST API
 - Docker deployment behind HAProxy
 - No third-party Python packages
@@ -77,6 +77,7 @@ python -m unittest -v
 - The API requires a random bearer key. The browser UI uses an HTTP-only, secure, signed cookie.
 - OAuth state values expire after ten minutes and are single-use.
 - The container runs as a non-root user with a read-only filesystem.
+- Publish calls are not blindly retried. A network timeout may occur after LinkedIn accepted a post, so an automatic retry could create a duplicate. The exact error is retained for review.
 
 ## Current scope
 
