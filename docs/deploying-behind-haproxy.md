@@ -186,6 +186,55 @@ Validate before reloading — this catches syntax errors before they take down e
 haproxy -c -f /etc/haproxy/haproxy.cfg && systemctl reload haproxy
 ```
 
+### Where everything lives
+
+```
+/docker/linkedin/app/                 deployment directory (source + config)
+├── app.py                            the service (single file)
+├── compose.yaml                      container definition
+├── Dockerfile                        python:3.13-alpine build
+├── .env                              secrets, mode 600, never committed
+└── .env.example                      template, committed
+
+/docker/docker/volumes/app_linkedin-data/_data/linkedin.db
+                                      SQLite volume — holds the live token
+```
+
+The volume is the important one. It is **not** in the deployment directory and it is **not** recreated by a rebuild, so a `build --no-cache` cannot destroy it. That separation is the whole reason a schema change or a bad deploy is recoverable: the container is disposable, the data is not.
+
+**Back up before touching anything.** The volume is the only copy of a 60-day access token:
+
+```bash
+sudo docker run --rm \
+  -v app_linkedin-data:/data \
+  -v /tmp:/backup alpine \
+  tar czf /backup/linkedin-$(date +%Y%m%d).tgz -C /data .
+```
+
+Restoring is the same command with `xzf` instead of `czf`, against a stopped container.
+
+### Container hardening
+
+The `compose.yaml` in this deployment does more than the upstream default:
+
+```yaml
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+```
+
+Confirmed in the running container:
+
+```
+readonly=true   user=publisher   privileged=false
+```
+
+`read_only: true` is why `docker cp` into the container fails with *"container rootfs is marked read-only"* — that error is the hardening working, not a bug. `/tmp` is a tmpfs so anything that needs scratch space still has it.
+
+The process runs as `publisher`, not root, so a compromise starts with no privileges to escalate from.
+
 ### Configuration
 
 `.env`, mode `600`, never committed (`.gitignore` covers it):
@@ -205,6 +254,23 @@ USER_TIMEZONE=America/New_York
 ```
 
 `APP_API_KEY` and `SESSION_SECRET` are generated locally with `openssl rand -hex 32` and must each be at least 32 characters — the app refuses to start otherwise.
+
+`OAUTH_SCOPE` is deliberately a variable rather than a literal. Being able to change the requested scopes without editing code is what made the OAuth debugging above tractable.
+
+**Changing `.env` requires recreating the container, not restarting it.** The environment is frozen at container creation:
+
+```bash
+sudo docker compose up -d --force-recreate     # picks up new .env values
+sudo docker restart linkedin-publisher         # does NOT
+```
+
+Verify the value actually landed inside the running container before trusting it:
+
+```bash
+sudo docker exec linkedin-publisher env | grep DEFAULT_HASHTAGS
+```
+
+This matters more than it sounds. The app appends `#NetScout` at *queue* time based on this variable, so checking it on disk is not enough — it has to be checked in the process that will read it.
 
 ---
 
@@ -310,7 +376,100 @@ Scheduled posts take an ISO 8601 time:
 -d '{"text":"...","scheduled_at":"2026-10-05T14:00:00-04:00"}'
 ```
 
-`#NetScout` is appended automatically unless the text already contains it.
+`#NetScout` is appended automatically unless the text already contains it — and only if `DEFAULT_HASHTAGS` is set. Set it to an empty value to disable the tag entirely:
+
+```
+DEFAULT_HASHTAGS=
+```
+
+Then recreate the container, since the variable is read at queue time from the frozen environment.
+
+### Posting long text
+
+LinkedIn caps a post at 3,000 characters. Build the payload with a tool rather than hand-escaping newlines — JSON escaping by hand is where multi-paragraph posts break:
+
+```bash
+python3 -c "import json; print(json.dumps({'text': open('post.txt').read().strip()}))" > /tmp/post.json
+```
+
+Then send the file:
+
+```bash
+curl -X POST https://linkedin.fcp3.me/api/posts \
+  -H "Authorization: Bearer $APP_API_KEY" \
+  -H "Content-Type: application/json" \
+  --data-binary @/tmp/post.json
+```
+
+### Reading state
+
+The API is the only interface that reports outcomes. The browser UI shows the same rows, but the API is scriptable:
+
+```bash
+curl -s https://linkedin.fcp3.me/api/posts \
+  -H "Authorization: Bearer $APP_API_KEY"
+```
+
+Each row carries `status`, `attempts`, `public_url`, and `last_error`. A healthy post is `status: published`, `attempts: 1`, `last_error: null`. Anything with `attempts > 1` deserves a look, and `last_error` holds the verbatim provider response.
+
+Querying the database directly is also fine, and is the fastest way to confirm a publish landed:
+
+```bash
+sudo docker exec linkedin-publisher python3 -c "
+import sqlite3
+c = sqlite3.connect('/data/linkedin.db')
+for r in c.execute('SELECT id, status, attempts, public_url, last_error FROM posts ORDER BY id DESC LIMIT 5'):
+    print(r)
+"
+```
+
+### Publishing failures are not retried
+
+This is deliberate, and it is the single most important behaviour to understand. The scheduler marks a failed publish as `failed` and **does not** queue an automatic retry.
+
+A network timeout on the POST is ambiguous. LinkedIn may have accepted the post before the connection dropped. Retrying automatically would publish a duplicate. The app's own comment says so:
+
+> A timed-out POST may have reached LinkedIn. Automatic retries can create duplicates, so ambiguous publish failures require review.
+
+The `last_error` column preserves the exact provider response for that review.
+
+---
+
+## Operating it
+
+### The publish loop
+
+The scheduler thread wakes every `POLL_SECONDS` (30 by default) and processes due rows. There is no cron entry, no systemd timer, and no external trigger — the loop lives inside the container. That means:
+
+- Stopping the container stops publishing.
+- `restart: unless-stopped` brings it back after a host reboot.
+- A backlog drains on the next tick once the container is back.
+
+### Restarting cleanly
+
+```bash
+cd /docker/linkedin/app
+
+# Code changed — rebuild, then recreate
+sudo docker compose build --no-cache && sudo docker compose up -d --force-recreate
+
+# Only .env changed — recreate is enough
+sudo docker compose up -d --force-recreate
+
+# Nothing changed, just want it bounced
+sudo docker compose restart
+```
+
+### When the healthcheck fails
+
+The Dockerfile defines a healthcheck against `/healthz` with a 30-second interval and 5-second start period. If `docker ps` shows `(unhealthy)`, the app is not answering on its internal port:
+
+```bash
+sudo docker inspect linkedin-publisher --format '{{.State.Health.Status}} restarts={{.RestartCount}}'
+sudo docker logs --tail 50 linkedin-publisher
+```
+
+A crashed app writes the traceback to the container log — the process prints to stdout, so `docker logs` is the only place it appears. There is no log file on disk.
 
 ---
 
@@ -329,7 +488,40 @@ Scheduled posts take an ISO 8601 time:
 ## Repository
 
 - **App:** https://github.com/fcp999/LiPoster
-- **This fix:** branch `oauth-id-token-fix`, commit `41c3055` — *Resolve OAuth identity without the userinfo endpoint*
-- **Changes:** 2 files, 57 insertions, 6 deletions
+- **OAuth fix:** commit `41c3055` — *Resolve OAuth identity without the userinfo endpoint* (2 files, 57 insertions, 6 deletions), also merged to `main`
+- **This document:** `docs/deploying-behind-haproxy.md`
 
-The branch makes the OAuth flow complete on an application without the OIDC product's full entitlements, makes the requested scopes configurable, and stops collapsing distinct OAuth failures into one misleading message. The scope ladder above is documented in the commit message, so the next person doesn't spend an afternoon rediscovering it.
+The fix makes the OAuth flow complete on an application without the OIDC product's full entitlements, makes the requested scopes configurable, and stops collapsing distinct OAuth failures into one misleading message. The scope ladder above is in the commit message, so the next person doesn't spend an afternoon rediscovering it.
+
+### Verifying the public tree is clean
+
+The repo is public, so the source is readable by anyone. Nothing sensitive is in it, and that is worth being able to prove rather than assume. Check that `.env` was never tracked in any commit on any branch:
+
+```bash
+git log --all --oneline -- .env          # expect no output
+```
+
+Scan every commit for a known secret value:
+
+```bash
+git grep -I -n -E '<value>' $(git rev-list --all)
+```
+
+And confirm the file is ignored going forward:
+
+```bash
+git check-ignore -v .env
+```
+
+Repeat this after any commit that touches configuration. A secret committed once is in the history permanently, and removing it requires rewriting every commit after it — which breaks every clone. Prevention is the only cheap option.
+
+### What the repository deliberately does not contain
+
+| Not in the repo | Where it lives instead |
+| --- | --- |
+| `.env` with real values | `/docker/linkedin/app/.env`, mode 600 |
+| The LinkedIn access token | `linkedin.db`, inside the Docker volume |
+| Client ID and secret | The `.env` above |
+| `APP_API_KEY`, `SESSION_SECRET` | The `.env` above |
+
+The `.env.example` file *is* committed, and it contains placeholder strings that look like credentials. They are fake — the format examples in it are keyboard-mash, not real values. Worth knowing so the next person auditing the repo doesn't panic at the sight of them.
