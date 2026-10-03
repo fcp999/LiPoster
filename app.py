@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import html
@@ -33,6 +34,10 @@ DEFAULT_HASHTAGS = os.getenv("DEFAULT_HASHTAGS", "#NetScout").strip()
 PORT = int(os.getenv("PORT", "8080"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 USER_TIMEZONE = os.getenv("USER_TIMEZONE", "America/New_York")
+# OpenID Connect scopes (openid/profile) require the "Sign In with LinkedIn using
+# OpenID Connect" product. When unavailable, fall back to w_member_social only and
+# resolve the person URN through the legacy /v2/me endpoint.
+OAUTH_SCOPE = os.getenv("OAUTH_SCOPE", "openid profile w_member_social")
 
 
 SCHEMA = """
@@ -106,6 +111,41 @@ def linkedin_request(method: str, url: str, token: str | None = None,
         except json.JSONDecodeError:
             payload = {"message": raw}
         raise RuntimeError(f"LinkedIn HTTP {exc.code}: {json.dumps(payload, separators=(',', ':'))}") from exc
+
+
+def person_id_from_token(token: dict) -> str | None:
+    """Read the LinkedIn person id from the OIDC id_token, when one was issued.
+
+    The id_token is a signed JWT whose sub claim is the person id. Reading it
+    locally avoids calling /v2/userinfo, which LinkedIn may deny independently of
+    the granted scopes.
+    """
+    id_token = token.get("id_token")
+    if not id_token:
+        return None
+    try:
+        payload_b64 = id_token.split(".")[1]
+        payload_b64 += "=" * (-len(payload_b64) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload_b64))
+    except (IndexError, ValueError, json.JSONDecodeError):
+        return None
+    sub = claims.get("sub")
+    return sub.removeprefix("urn:li:person:") if sub else None
+
+
+def fetch_person_id(token: str) -> str:
+    """Return the LinkedIn person id from whichever identity endpoint is permitted."""
+    if "openid" in OAUTH_SCOPE:
+        _, profile, _ = linkedin_request("GET", "https://api.linkedin.com/v2/userinfo", token)
+        return profile["sub"]
+    if "r_liteprofile" in OAUTH_SCOPE or "r_basicprofile" in OAUTH_SCOPE:
+        _, me, _ = linkedin_request("GET", "https://api.linkedin.com/v2/me", token)
+        return me["id"]
+    raise RuntimeError(
+        "Cannot resolve the LinkedIn person id: token has no identity scope. Add "
+        "r_liteprofile (Share on LinkedIn) or openid (Sign In with LinkedIn using "
+        "OpenID Connect) to OAUTH_SCOPE."
+    )
 
 
 def current_oauth() -> sqlite3.Row | None:
@@ -256,7 +296,7 @@ class Handler(BaseHTTPRequestHandler):
                 "client_id": CLIENT_ID,
                 "redirect_uri": f"{BASE_URL}/auth/linkedin/callback",
                 "state": state,
-                "scope": "openid profile w_member_social",
+                "scope": OAUTH_SCOPE,
             })
             self.redirect(f"https://www.linkedin.com/oauth/v2/authorization?{query}")
             return
@@ -267,20 +307,31 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 row = conn.execute("SELECT * FROM oauth_states WHERE state=? AND expires_at>=?", (state, now())).fetchone()
                 conn.execute("DELETE FROM oauth_states WHERE state=?", (state,))
-            if not row or not code:
-                self.send_json(400, {"error": "Invalid or expired OAuth state"})
+            provider_error = args.get("error", [""])[0]
+            provider_desc = args.get("error_description", [""])[0]
+            if provider_error:
+                self.send_json(400, {"error": provider_error, "error_description": provider_desc,
+                                     "state_valid": bool(row)})
+                return
+            if not row:
+                self.send_json(400, {"error": "invalid_or_expired_state",
+                                     "error_description": "OAuth state was not found or has expired"})
+                return
+            if not code:
+                self.send_json(400, {"error": "missing_code",
+                                     "error_description": "Callback arrived without an authorization code"})
                 return
             try:
                 _, token, _ = linkedin_request("POST", "https://www.linkedin.com/oauth/v2/accessToken", form={
                     "grant_type": "authorization_code", "code": code, "client_id": CLIENT_ID,
                     "client_secret": CLIENT_SECRET, "redirect_uri": f"{BASE_URL}/auth/linkedin/callback",
                 })
-                _, profile, _ = linkedin_request("GET", "https://api.linkedin.com/v2/userinfo", token["access_token"])
+                person_id = person_id_from_token(token) or fetch_person_id(token["access_token"])
                 with db() as conn:
                     conn.execute(
                         "INSERT INTO oauth(singleton,access_token,expires_at,person_id,updated_at) VALUES(1,?,?,?,?) "
                         "ON CONFLICT(singleton) DO UPDATE SET access_token=excluded.access_token,expires_at=excluded.expires_at,person_id=excluded.person_id,updated_at=excluded.updated_at",
-                        (token["access_token"], now() + int(token["expires_in"]), profile["sub"], now()),
+                        (token["access_token"], now() + int(token["expires_in"]), person_id, now()),
                     )
                 self.redirect("/", f"session={signed_session()}; Path=/; HttpOnly; Secure; SameSite=Lax")
             except Exception as exc:
