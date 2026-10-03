@@ -20,6 +20,7 @@ from http import HTTPStatus
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 
 DB_PATH = os.getenv("DB_PATH", "/data/linkedin.db")
@@ -30,8 +31,8 @@ API_KEY = os.getenv("APP_API_KEY", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 DEFAULT_HASHTAGS = os.getenv("DEFAULT_HASHTAGS", "#NetScout").strip()
 PORT = int(os.getenv("PORT", "8080"))
-MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
+USER_TIMEZONE = os.getenv("USER_TIMEZONE", "America/New_York")
 
 
 SCHEMA = """
@@ -170,10 +171,10 @@ def process_due_posts() -> None:
                     (post_id, public_url, now(), post["id"]),
                 )
         except Exception as exc:
-            attempts = post["attempts"] + 1
-            retryable = attempts < MAX_RETRIES and "HTTP 4" not in str(exc)
-            status = "retry" if retryable else "failed"
-            delay = min(60 * (2 ** attempts), 1800) if retryable else 0
+            # A timed-out POST may have reached LinkedIn. Automatic retries can
+            # create duplicates, so ambiguous publish failures require review.
+            status = "failed"
+            delay = 0
             with db() as conn:
                 conn.execute(
                     "UPDATE posts SET status=?,scheduled_at=?,last_error=?,updated_at=? WHERE id=?",
@@ -341,7 +342,7 @@ class Handler(BaseHTTPRequestHandler):
             form = urllib.parse.parse_qs(self.rfile.read(size).decode())
             try:
                 raw_time = form.get("scheduled_at", [""])[0]
-                schedule = datetime.fromisoformat(raw_time).astimezone().timestamp() if raw_time else None
+                schedule = datetime.fromisoformat(raw_time).replace(tzinfo=ZoneInfo(USER_TIMEZONE)).timestamp() if raw_time else None
                 queue_post(form.get("text", [""])[0], schedule)
                 self.redirect("/")
             except ValueError as exc:
