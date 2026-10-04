@@ -324,7 +324,16 @@ def parse_feed(xml_text: str) -> list[dict]:
         # to the description. Strip that footer so it does not count toward
         # the post length or appear in the published text.
         text = re.sub(r"(?i)\s*the post .*? appeared first on [^.]+\.?\s*$", "", text).strip()
-        return text[:limit]
+        if len(text) <= limit:
+            return text
+        # Cut at a sentence boundary rather than mid-word. A body that stops
+        # mid-sentence ("...is not only high-") reads as broken on the feed.
+        cut = text[: limit + 1]
+        boundary = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+        if boundary >= limit * 0.5:
+            return cut[: boundary + 1].strip()
+        space = text[:limit].rfind(" ")
+        return text[:space].strip() if space >= limit * 0.5 else text[:limit]
 
     for block in blocks:
         title = clean(pick(block, "title"), 300)
