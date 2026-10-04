@@ -89,6 +89,23 @@ FEEDS_ENABLED = os.getenv("FEEDS_ENABLED", "1").strip() not in ("", "0", "false"
 GENERATOR_ENABLED = os.getenv("GENERATOR_ENABLED", "1").strip() not in ("", "0", "false", "no")
 # How far back a story may be, in days.
 STORY_MAX_AGE_DAYS = int(os.getenv("STORY_MAX_AGE_DAYS", "7"))
+# Local-model screening gate. Word filters miss a launch post written as an
+# article: the title reads like a headline and the selling language is absent
+# from the marketing-page markers. Ask a local model to classify the body
+# before the story is queued. Fails open so an unreachable model does not
+# silently dry up the feed.
+PROMO_GATE_ENABLED = os.getenv("PROMO_GATE_ENABLED", "1").strip() not in ("", "0", "false", "no")
+PROMO_GATE_URL = os.getenv("PROMO_GATE_URL", "http://192.168.0.50:11434").rstrip("/")
+PROMO_GATE_MODEL = os.getenv("PROMO_GATE_MODEL", "qwen2.5:7b")
+PROMO_GATE_TIMEOUT = int(os.getenv("PROMO_GATE_TIMEOUT", "60"))
+# Deterministic pre-filter: phrases a vendor uses about its own offering.
+PROMO_GATE_MARKERS = (
+    "offers protection for", "our suite", "our platform", "our retainer",
+    "retainer offerings", "proud to announce", "we are pleased to",
+    "now generally available", "book a meeting", "schedule a demo",
+    "request a demo", "excited to announce", "learn how our", "our product",
+    "our new service", "available today",
+)
 
 
 
@@ -843,6 +860,54 @@ def summarize(url: str) -> str:
     return extract_article(raw)[:900]
 
 
+def is_promotional(title: str, body: str) -> bool:
+    """True when an article reads as a vendor announcement, not reporting.
+
+    A product launch written as a blog post defeats the keyword filters: the
+    headline looks like a story and the selling language ("our suite", "proud
+    to announce") is invisible to COMMERCIAL_MARKERS, which targets pricing
+    pages. Classify the body with a local model instead. Fails open: if the
+    model cannot be reached, keep the article rather than emptying the feed.
+    """
+    if not PROMO_GATE_ENABLED:
+        return False
+    low = f"{title} {body}".lower()
+    if any(marker in low for marker in PROMO_GATE_MARKERS):
+        print(f"promo gate: marker hit for {title!r}", flush=True)
+        return True
+    prompt = (
+        "You are screening articles for an engineering news feed.\n"
+        "Decide whether the article below is a VENDOR PRODUCT OR SERVICE "
+        "ANNOUNCEMENT (written to promote or sell the author's own product) "
+        "or INDEPENDENT REPORTING (news, research, tutorial, analysis).\n"
+        "Marketing language, first-person vendor voice, a named commercial "
+        "offering, pricing, or a call to contact sales indicate an "
+        "announcement.\n"
+        "Reply with exactly one word: ANNOUNCEMENT or REPORTING.\n\n"
+        f"TITLE: {title}\n\nARTICLE: {body[:2500]}"
+    )
+    payload = json.dumps({
+        "model": PROMO_GATE_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0, "num_predict": 8},
+    }).encode()
+    try:
+        request = urllib.request.Request(
+            f"{PROMO_GATE_URL}/api/generate",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=PROMO_GATE_TIMEOUT) as response:
+            answer = json.loads(response.read()).get("response", "")
+    except Exception as exc:
+        print(f"promo gate unavailable ({exc}); keeping article", flush=True)
+        return False
+    verdict = answer.strip().upper()
+    print(f"promo gate: {verdict[:40]} for {title!r}", flush=True)
+    return verdict.startswith("ANNOUNCEMENT")
+
+
 def generate_daily_post() -> None:
     """Queue one story for today, at most once per day, in topic rotation."""
     if not GENERATOR_ENABLED:
@@ -898,6 +963,9 @@ def generate_daily_post() -> None:
             except Exception as exc:
                 print(f"summary fetch failed for {url}: {exc}", flush=True)
                 body = title
+        if is_promotional(title, body):
+            print(f"skipping {url}: promotional, not reporting", flush=True)
+            continue
         text = build_post(title, url, domain, body)
         if not post_is_substantial(text, url):
             print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
@@ -935,6 +1003,9 @@ def generate_daily_post() -> None:
             print(f"summary fetch failed for {url}: {exc}; using search snippet", flush=True)
         if not body:
             body = title
+        if is_promotional(title, body):
+            print(f"skipping {url}: promotional, not reporting", flush=True)
+            continue
         text = build_post(title, url, domain, body)
         if not post_is_substantial(text, url):
             print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
