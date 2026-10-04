@@ -31,7 +31,7 @@ linkedin-publisher container          python:3.13-alpine, non-root, read-only ro
    └── SQLite volume (/data/linkedin.db)
 ```
 
-Four design choices carried most of the weight.
+Five design choices carried most of the weight.
 
 **One file, standard library only.** No Flask, no requests, no scheduler library. `http.server.ThreadingHTTPServer` for the API, a daemon thread for the publish loop, `urllib` for outbound calls, `sqlite3` for state. That means no dependency tree to audit and no surface beyond the one file.
 
@@ -40,6 +40,8 @@ Four design choices carried most of the weight.
 **Scopes as configuration.** `OAUTH_SCOPE` is an environment variable rather than a string literal in the code. This turned out to be essential, not merely tidy — the entire afternoon was a sequence of changing which scopes to request.
 
 **Identity from the token, not from an API call.** Explained below; this was the fix that made everything work.
+
+**Stories from curated feeds, not search.** The generator reads RSS and Atom feeds from sources with editorial standards. Every item in a feed is an article by construction, so there is no ranking problem and no way for a vendor landing page to enter the queue. Web search remains a fallback. This replaced a search-ranking approach that produced navigation menus and product pages, and the replacement is the single most important design decision in the project.
 
 ---
 
@@ -473,7 +475,91 @@ A crashed app writes the traceback to the container log — the process prints t
 
 ---
 
+## The daily generator
+
+A second job runs in the same scheduler thread: once per day it selects a story, queues it, and lets the normal publish loop handle delivery. No cron, no systemd timer, no external trigger.
+
+### Schedule
+
+```
+DAILY_HOUR_WEEKDAY=10     weekdays, America/New_York
+DAILY_HOUR_WEEKEND=7      weekends
+```
+
+The story is queued immediately and published by the scheduler, so the post goes out at the configured hour. A `story_log` table records one row per day, which both prevents a second post on the same day and keeps a history of what was published from where.
+
+### Topic rotation
+
+A `generator_state` table holds a cursor. Each day advances through the configured categories in order, so every topic is attempted before any repeats. If a category has no unseen story, the next one is tried rather than skipping the day silently.
+
+```
+packet analysis → network security → networking → security research
+→ security tooling → ai tooling → quantum computing
+```
+
+### Why feeds rather than search
+
+The first version ranked search results. It failed in a specific and instructive way: the highest-scoring candidates were vendor landing pages, category indexes, and homepages.
+
+```
+[50] fortinet.com        "What Is Network Traffic?"     — vendor glossary
+[60] darkreading.com     "Vulnerabilities & Threats"    — category index
+[52] thehackernews.com  "The Hacker News"              — homepage
+```
+
+No amount of scoring fixes this, because the problem is the source, not the ranking. Search returns pages *about* a topic; a feed returns that publication's articles, in order, with dates.
+
+Two source shapes deserve specific mention as traps:
+
+**`releases.atom` feeds look like content but are not.** A project's release feed yields build numbers and changelog dumps — `b11382` with a 7 KB HTML blob as its summary. Every item is a release by definition, so scoring cannot promote an article that does not exist. These were dropped.
+
+**A single-source category will go dry.** "security tooling" began with one Suricata feed and one candidate. Within days it would fall through to the search fallback, which is exactly where the bad picks lived.
+
+### Source file
+
+Feeds live in `feeds.txt`, not in `.env`, because `.env` cannot hold a multi-line value without quoting. The file is mounted read-only into the container:
+
+```yaml
+volumes:
+  - linkedin-data:/data
+  - ./feeds.txt:/data/feeds.txt:ro
+```
+
+Format is one `category|url` per line:
+
+```
+packet analysis|https://zeek.org/feed/
+network security|https://feeds.feedburner.com/feedburner/Talos
+quantum computing|https://arxiv.org/rss/quant-ph
+```
+
+Every URL in the shipped list was fetched and confirmed to return parseable RSS or Atom. Two findings worth keeping: Talos publishes no working feed at `blog.talosintelligence.com/rss/` — it returns an HTML error page — but syndicates correctly through `feeds.feedburner.com/feedburner/Talos`. And `arxiv.org/rss/quant-ph` declares `<skipDays>Saturday, Sunday</skipDays>`, so an empty weekend result is correct behaviour, not a broken source.
+
+### Summary extraction
+
+Feed bodies arrive in inconsistent shapes, and two ordering mistakes cost real debugging time:
+
+```python
+text = html.unescape(html.unescape(value))          # unescape FIRST
+text = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", text)
+text = re.sub(r"(?s)<[^>]+>", " ", text)            # then strip
+text = html.unescape(text)                           # catch double-encoding
+text = re.sub(r"\s+", " ", text).strip()
+```
+
+Unescaping must precede stripping. Many feeds deliver the body entity-encoded, so `<p>` arrives as `&lt;p&gt;`. A strip pass running first matches nothing, and the later `unescape` then materialises literal tags into the published post.
+
+Selection also matters: a feed often pairs a one-line `<description>` with the full `<content:encoded>`. Taking the first non-empty field yields a tagline; taking the longest yields the article.
+
+### Opinion posts
+
+Feeds interleave culture and opinion writing with reporting, and sorting by date will happily put a wellness column above a threat advisory. A title filter drops the obvious cases — wellness, hiring, newsletters, podcasts, event promotion — plus any title under four words. It is a heuristic, not a classifier, and it is deliberately narrow.
+
+---
+
 ## What I'd do differently
+
+**Prove the output before enabling the schedule.** The first unattended run published a navigation menu, because the extractor had never been tested against a real page. A dry-run that prints what *would* be published takes a minute and catches exactly this. Build the dry-run first, then arm the schedule.
 
 **Verify the running code, always.** The stale-image problem wasted more time than any LinkedIn API issue. A hash comparison takes five seconds.
 
@@ -523,5 +609,6 @@ Repeat this after any commit that touches configuration. A secret committed once
 | The LinkedIn access token | `linkedin.db`, inside the Docker volume |
 | Client ID and secret | The `.env` above |
 | `APP_API_KEY`, `SESSION_SECRET` | The `.env` above |
+| `feeds.txt` | `/docker/linkedin/app/feeds.txt`, mounted read-only |
 
 The `.env.example` file *is* committed, and it contains placeholder strings that look like credentials. They are fake — the format examples in it are keyboard-mash, not real values. Worth knowing so the next person auditing the repo doesn't panic at the sight of them.
