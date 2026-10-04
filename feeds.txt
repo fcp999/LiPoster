@@ -1,0 +1,54 @@
+# Curated story sources for the LinkedIn daily post generator.
+# Format:  category|url
+# Lines starting with # are ignored. Duplicate URLs are dropped.
+#
+# Feeds are preferred over web search: every item in a feed is an article by
+# construction, so there is no ranking problem, and vendor landing pages and
+# product pages cannot enter the queue. Search is a fallback only.
+#
+# Category names drive the daily rotation. Renaming one restarts its position
+# in the cycle; keep them stable once running.
+#
+# Every URL below was fetched and confirmed to return parseable RSS or Atom.
+
+# ---- packet analysis -------------------------------------------------------
+packet analysis|https://zeek.org/feed/
+packet analysis|https://isc.sans.edu/rssfeed.xml
+
+# ---- network security ------------------------------------------------------
+network security|https://feeds.feedburner.com/feedburner/Talos
+network security|https://unit42.paloaltonetworks.com/feed/
+network security|https://www.cisa.gov/cybersecurity-advisories/all.xml
+
+# ---- networking ------------------------------------------------------------
+networking|https://blog.apnic.net/feed/
+networking|https://labs.ripe.net/feed.xml
+networking|https://blog.cloudflare.com/rss/
+
+# ---- security research -----------------------------------------------------
+security research|https://googleprojectzero.blogspot.com/feeds/posts/default
+security research|https://feeds.feedburner.com/TheHackersNews
+
+# ---- security tooling ------------------------------------------------------
+# Release-note feeds are deliberately excluded: they yield build numbers and
+# changelogs rather than articles. These publish engineering write-ups.
+security tooling|https://suricata.io/feed/
+security tooling|https://blog.trailofbits.com/feed/
+security tooling|https://blog.qualys.com/feed
+security tooling|https://blog.rapid7.com/rss/
+security tooling|https://seclists.org/rss/fulldisclosure.rss
+
+# ---- ai tooling ------------------------------------------------------------
+# Same reasoning: no releases.atom here. These are authored posts.
+ai tooling|https://simonwillison.net/atom/everything/
+ai tooling|https://blog.google/technology/ai/rss/
+ai tooling|https://huggingface.co/blog/feed.xml
+ai tooling|https://pytorch.org/blog/feed.xml
+ai tooling|https://lilianweng.github.io/index.xml
+
+# ---- quantum computing -----------------------------------------------------
+quantum computing|https://quantumzeitgeist.com/feed/
+quantum computing|https://thequantuminsider.com/feed/
+quantum computing|https://www.quantamagazine.org/feed/
+# arXiv quant-ph publishes Mon-Fri only; its feed is legitimately empty on weekends.
+quantum computing|https://arxiv.org/rss/quant-ph
