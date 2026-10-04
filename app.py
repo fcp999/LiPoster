@@ -320,6 +320,10 @@ def parse_feed(xml_text: str) -> list[dict]:
         text = re.sub(r"(?s)<[^>]+>", " ", text)
         text = repair_entities(text)
         text = re.sub(r"\s+", " ", text).strip()
+        # WordPress feeds append "The post <title> appeared first on <site>."
+        # to the description. Strip that footer so it does not count toward
+        # the post length or appear in the published text.
+        text = re.sub(r"(?i)\s*the post .*? appeared first on [^.]+\.?\s*$", "", text).strip()
         return text[:limit]
 
     for block in blocks:
@@ -890,15 +894,15 @@ def generate_daily_post() -> None:
             print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
             continue
         scheduled = moment.replace(hour=due_hour(moment), minute=0, second=0, microsecond=0)
-        post_id = draft_post(text, int(scheduled.timestamp()))
+        post_id = queue_post(text, int(scheduled.timestamp()))
         with db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO story_log(post_id,topic,day,title,url,domain,query,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (post_id, category, day, title, url, domain, story.get("_source", ""), now()),
             )
-        set_generator_state((index + 1) % len(categories), day, "drafted", None)
-        print(f"daily post drafted: {category} -> {url}", flush=True)
+        set_generator_state((index + 1) % len(categories), day, "queued", None)
+        print(f"daily post queued: {category} -> {url}", flush=True)
         return
 
     print("daily post: feeds dry, falling back to search", flush=True)
@@ -927,15 +931,15 @@ def generate_daily_post() -> None:
             print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
             continue
         scheduled = moment.replace(hour=due_hour(moment), minute=0, second=0, microsecond=0)
-        post_id = draft_post(text, int(scheduled.timestamp()))
+        post_id = queue_post(text, int(scheduled.timestamp()))
         with db() as conn:
             conn.execute(
                 "INSERT OR IGNORE INTO story_log(post_id,topic,day,title,url,domain,query,created_at) "
                 "VALUES(?,?,?,?,?,?,?,?)",
                 (post_id, topic, day, title, url, domain, topic, now()),
             )
-        set_generator_state((index + 1) % len(TOPICS), day, "drafted", None)
-        print(f"daily post drafted: {topic} -> {url}", flush=True)
+        set_generator_state((index + 1) % len(TOPICS), day, "queued", None)
+        print(f"daily post queued: {topic} -> {url}", flush=True)
         return
     set_generator_state(cursor, day, "no_story", "no unseen story for any topic")
     print("daily post: no unseen story found", flush=True)
