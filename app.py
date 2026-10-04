@@ -761,8 +761,29 @@ def pick_story(topic: str) -> dict | None:
 MIN_POST_CHARS = int(os.getenv("MIN_POST_CHARS", "350"))
 
 
+def complete_sentence(text: str) -> str:
+    """Drop an incomplete trailing sentence from a body.
+
+    RSS descriptions are often truncated by the publisher, so a body can end
+    mid-clause ("...allows attackers. \"An improper"). Trimming back to the
+    last sentence boundary keeps the published text readable. Only trims when
+    the remaining head is still most of the text, so a short or single-sentence
+    body is left untouched.
+    """
+    text = text.strip()
+    if not text or text[-1] in '.!?…"”’)':
+        return text
+    boundary = max(text.rfind(". "), text.rfind("! "), text.rfind("? "))
+    if boundary < 0:
+        return text
+    head = text[: boundary + 1].strip()
+    if len(head) >= max(200, int(len(text) * 0.6)):
+        return head
+    return text
+
+
 def build_post(title: str, url: str, domain: str, summary: str) -> str:
-    parts = [summary.strip() or title.strip()]
+    parts = [complete_sentence(summary) or title.strip()]
     parts.append(url)
     text = "\n\n".join(p for p in parts if p)
     if DEFAULT_HASHTAGS and DEFAULT_HASHTAGS.lower() not in text.lower():
