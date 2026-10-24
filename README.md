@@ -27,6 +27,33 @@ openssl rand -hex 32
 openssl rand -hex 32
 ```
 
+## Who posts
+
+This tool publishes to a **personal LinkedIn profile**, not a company page. That
+is a consequence of the API scope it uses, not a limitation that can be
+configured away.
+
+- **The author is whoever approves the OAuth flow.** Posts are addressed to
+  `urn:li:person:{id}`, where the ID comes from the `id_token` returned during
+  the connect step. There is no setting for posting as someone else, and no
+  way to queue a post on behalf of another member.
+- **Company pages are not supported.** Posting as an organization requires a
+  different LinkedIn product (Sharing on LinkedIn for organization pages) and
+  admin rights on that page. The scope this app requests,
+  `w_member_social`, posts as the member only.
+- **Mentioning an employer is a profile association, not an API feature.** If
+  your profile is linked to a company, you can name that company in a post the
+  same way you would type it by hand. The app does not tag companies for you.
+- **The brand hashtag is content-driven.** `#NetScout` is never appended
+  automatically. A post carries it only when the word appears in the summarised
+  article. Set `DEFAULT_HASHTAGS=` in `.env` (the default) to keep it that way.
+- **One profile per deployment.** The OAuth row in `/data/linkedin.db` holds a
+  single token. Connecting a second profile replaces the first, so run a
+  separate container and database per account.
+
+If you need organization-page posting, that is a separate integration with a
+different scope and a page-admin approval step. It is out of scope here.
+
 ## Run
 
 ```bash
