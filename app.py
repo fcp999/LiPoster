@@ -32,27 +32,232 @@ CLIENT_SECRET = os.getenv("LINKEDIN_CLIENT_SECRET", "")
 API_KEY = os.getenv("APP_API_KEY", "")
 SESSION_SECRET = os.getenv("SESSION_SECRET", "")
 DEFAULT_HASHTAGS = os.getenv("DEFAULT_HASHTAGS", "#NetScout").strip()
+MAX_INLINE_TAGS = int(os.getenv("MAX_INLINE_TAGS", "4"))
+# Curated RSS/Atom feeds, one per line as "Category|URL".
+FEED_SOURCES_FILE = os.getenv("FEED_SOURCES_FILE", "/data/feeds.txt")
+# A feed body shorter than this is a tagline or a truncated blurb, not an
+# article. Fetch the page and use the longer text instead.
+MIN_FEED_BODY_CHARS = int(os.getenv("MIN_FEED_BODY_CHARS", "600"))
+# A post must end on a real sentence. Truncated feed bodies frequently stop
+# mid-clause ("...corrupt a program's memory, potentially"), which publishes
+# as a broken post, so a body below this length is rejected rather than
+# trimmed to fit.
+MIN_POST_BODY_CHARS = int(os.getenv("MIN_POST_BODY_CHARS", "700"))
+# How many ranked candidates to try in a category before giving up on it.
+MAX_CANDIDATES_PER_CATEGORY = int(os.getenv("MAX_CANDIDATES_PER_CATEGORY", "12"))
+# Extra summary attempts when the result would be too short to publish. A short
+# post is a reason to ask for a fuller one, not to drop the story.
+SUMMARY_RETRIES = int(os.getenv("SUMMARY_RETRIES", "2"))
+# Article summarisation. A post is an original summary in the account owner's
+# voice, not an excerpt: the source body is never published verbatim, and the
+# source URL at the end is the attribution.
+SUMMARY_ENABLED = os.getenv("SUMMARY_ENABLED", "1").strip() not in ("", "0", "false", "no")
+# Tried in order. A local model first because it is free and private; a cloud
+# fallback because a failed summary must not cost a day's post.
+SUMMARY_MODELS = [
+    (os.getenv("SUMMARY_URL_PRIMARY", "http://192.168.0.50:11434"),
+     os.getenv("SUMMARY_MODEL_PRIMARY", "qwen2.5:7b")),
+    (os.getenv("SUMMARY_URL_FALLBACK", "http://192.168.0.217:11434"),
+     os.getenv("SUMMARY_MODEL_FALLBACK", "deepseek-v4.1-flash:cloud")),
+]
+SUMMARY_TIMEOUT = int(os.getenv("SUMMARY_TIMEOUT", "180"))
+# Filler that turns a summary into a security-awareness deck. A small model
+# ignores prompt-side bans, so this is checked in code: a hit costs one
+# corrective retry, then the next model in the chain gets the job.
+BANNED_PHRASES = (
+    "highlights the importance of",
+    "highlight the importance of",
+    "underscores the importance",
+    "underscore the importance",
+    "serves as a reminder",
+    "serve as a reminder",
+    "it is crucial",
+    "it's crucial",
+    "critical importance",
+    "in today's landscape",
+    "in todays landscape",
+    "delve into",
+    "landscape",
+    "robust",
+    "leverage",
+    "necessitating",
+    "mitigate potential",
+    "it is essential",
+    "it's essential",
+    "remains to be seen",
+    "as always",
+    "staying vigilant",
+    "stay vigilant",
+    "wake-up call",
+    "game-changer",
+    "rapidly evolving",
+)
+SUMMARY_MIN_CHARS = int(os.getenv("SUMMARY_MIN_CHARS", "250"))
+SUMMARY_MAX_CHARS = int(os.getenv("SUMMARY_MAX_CHARS", "900"))
+# Characters that legitimately close a sentence.
+SENTENCE_END = '.!?…"”\')'
+
+
+def tidy_punctuation(text: str) -> str:
+    """Collapse the space paragraph-joining leaves before punctuation.
+
+    extract_article joins <p> blocks with a space, so a sentence that ended in
+    its own paragraph keeps that space: "build .", "as #CVE-2026-111497 , the
+    flaw". On a published post it reads like a typo.
+    """
+    text = re.sub(r"\s+([.,;:!?)])", r"\1", text)
+    text = re.sub(r"\(\s+", "(", text)
+    return re.sub(r"[ \t]{2,}", " ", text)
 PORT = int(os.getenv("PORT", "8080"))
 POLL_SECONDS = int(os.getenv("POLL_SECONDS", "30"))
 USER_TIMEZONE = os.getenv("USER_TIMEZONE", "America/New_York")
-# OpenID Connect scopes (openid/profile) require the "Sign In with LinkedIn using
-# OpenID Connect" product. When unavailable, fall back to w_member_social only and
-# resolve the person URN through the legacy /v2/me endpoint.
-OAUTH_SCOPE = os.getenv("OAUTH_SCOPE", "openid profile w_member_social")
 # Story search runs against a local SearXNG instance. It must answer the
 # JSON API, which is a non-default setting in SearXNG's settings.yml.
 SEARXNG_URL = os.getenv("SEARXNG_URL", "http://192.168.0.209:8082").rstrip("/")
-# Hour of the local day at which a story is fetched and queued. The story is
-# queued immediately and published by the normal scheduler, so the post goes
-# out at this hour.
+# Hour of the local day at which a story is fetched and queued.
 DAILY_HOUR_WEEKDAY = int(os.getenv("DAILY_HOUR_WEEKDAY", "10"))
 DAILY_HOUR_WEEKEND = int(os.getenv("DAILY_HOUR_WEEKEND", "7"))
-# Curated RSS/Atom feeds, one per line as "Category|URL". These are preferred
-# over search: they have editorial standards, and a feed item is an article by
-# construction, so there is no ranking problem to solve.
-# Feed sources live in a file, not an environment variable: .env cannot hold a
-# multi-line value without quoting, and a quoted block is fragile to edit.
-FEED_SOURCES_FILE = os.getenv("FEED_SOURCES_FILE", "/data/feeds.txt")
+
+# Hashtags used to live only in HASHTAGS_BY_CATEGORY (below) and were
+# appended as a tagline at the end of the post. Posts now carry their tags
+# inline, attached to the words they describe. Each entry is keyed by the
+# category in feeds.txt and lists (pattern, tag) pairs: the first word in the
+# post matching `pattern` gets `tag` glued to it ("packet" -> "packet#PCAP").
+# Tags that match nothing in the text are dropped rather than piled at the
+# end. The brand tag is treated the same way: attached when the word appears,
+# never appended just because it is configured.
+INLINE_TAGS_BY_CATEGORY = {
+    # Ordered by editorial value, strongest term first: MAX_INLINE_TAGS markers
+    # are spent from the top, so the first four patterns that find a word win.
+    # A vendor or product name is deliberately NOT here. Naming a competitor's
+    # product in a post implies an endorsement, so vendor terms are only
+    # tagged when the article is genuinely about that product, which is the
+    # subject-gate below, not a category keyword list.
+    "packet analysis": [
+        (r"pcap(s)?", "#PCAP"),
+        (r"packet capture", "#PacketCapture"),
+        (r"packets", "#packets"),
+        (r"deep packet inspection", "#DPI"),
+        (r"traffic analysis", "#TrafficAnalysis"),
+        (r"forensics", "#Forensics"),
+        (r"intrusion detection", "#IDS"),
+        (r"protocols", "#Protocols"),
+        (r"tcp", "#TCP"),
+        (r"latency", "#latency"),
+    ],
+    "network security": [
+        (r"vulnerabilit(y|ies)", "#vulnerabilities"),
+        (r"cve(?=[-\s]?\d)", "#CVE"),
+        (r"cves\b", "#CVEs"),
+        (r"zero-day", "#ZeroDay"),
+        (r"ransomware", "#ransomware"),
+        (r"breach(es)?", "#breaches"),
+        (r"exploitation", "#exploitation"),
+        (r"exploit(s|ing)?", "#exploits"),
+        (r"phishing", "#phishing"),
+        (r"backdoor(s)?", "#backdoors"),
+        (r"botnet(s)?", "#botnets"),
+        (r"malware", "#malware"),
+        (r"patch(es|ing)?", "#patching"),
+    ],
+    "networking": [
+        (r"bgp", "#BGP"),
+        (r"dns", "#DNS"),
+        (r"routing", "#routing"),
+        (r"outage(s)?", "#outages"),
+        (r"ipv6", "#IPv6"),
+        (r"anycast", "#anycast"),
+        (r"peering", "#peering"),
+        (r"congestion", "#congestion"),
+        (r"latency", "#latency"),
+        (r"protocols", "#protocols"),
+        (r"networks", "#networks"),
+    ],
+    "security research": [
+        (r"zero-day", "#ZeroDay"),
+        (r"reverse engineering", "#ReverseEngineering"),
+        (r"vulnerabilit(y|ies)", "#vulnerabilities"),
+        (r"exploitation", "#exploitation"),
+        (r"exploit(s|ing)?", "#exploits"),
+        (r"supply chain", "#SupplyChain"),
+        (r"credential(s)?", "#credentials"),
+        (r"token(s)?", "#tokens"),
+        (r"secret(s)?", "#secrets"),
+        (r"firmware", "#firmware"),
+        (r"side[- ]channel", "#SideChannel"),
+        (r"hardware", "#hardware"),
+        (r"research", "#research"),
+        (r"cve(?=[-\s]?\d)", "#CVE"),
+        (r"cves\b", "#CVEs"),
+    ],
+    "security tooling": [
+        (r"devsecops", "#DevSecOps"),
+        (r"open[- ]source", "#OpenSource"),
+        (r"fuzz(er|ing)?", "#fuzzing"),
+        (r"scanner(s)?", "#scanners"),
+        (r"supply chain", "#SupplyChain"),
+        (r"tool(s|ing)?", "#tools"),
+        (r"github", "#GitHub"),
+    ],
+    "ai tooling": [
+        (r"\bai\b", "#AI"),
+        (r"machine learning", "#MachineLearning"),
+        (r"language model(s)?", "#LLMs"),
+        (r"\bllms?\b", "#LLMs"),
+        (r"agent(s|ic)?", "#agents"),
+        (r"inference", "#inference"),
+        (r"model(s)?", "#models"),
+    ],
+    "quantum computing": [
+        (r"quantum", "#quantum"),
+        (r"qubit(s)?", "#qubits"),
+        (r"error correction", "#ErrorCorrection"),
+        (r"cryptograph(y|ic)", "#cryptography"),
+        (r"post[- ]quantum", "#PostQuantum"),
+    ],
+}
+
+# Subject gate for vendor/product names. A competitor product is tagged only
+# when the article is ABOUT that product -- its name in the title, or repeated
+# in the body -- not merely mentioned in passing. One passing reference is a
+# mention, not a recommendation, and tagging it looks like an endorsement.
+# Brand terms for NetScout's own products are always eligible when the word
+# appears: the account is the vendor, so naming itself is not an endorsement.
+VENDOR_TERMS = {
+    "wireshark": "#Wireshark",
+    "tshark": "#Wireshark",
+    "tcpdump": "#tcpdump",
+    "zeek": "#Zeek",
+    "suricata": "#Suricata",
+    "snort": "#Snort",
+    "nmap": "#Nmap",
+    "nprobe": "#ntop",
+    "ntopng": "#ntop",
+    "splunk": "#Splunk",
+    "elastic": "#Elastic",
+    "crowdstrike": "#CrowdStrike",
+    "palo alto": "#PaloAltoNetworks",
+    "fortinet": "#Fortinet",
+    "checkpoint": "#CheckPoint",
+    "darktrace": "#Darktrace",
+    "riverbed": "#Riverbed",
+    "solarwinds": "#SolarWinds",
+    "viavi": "#VIAVI",
+    "gigamon": "#Gigamon",
+    "keysight": "#Keysight",
+    "netreo": "#Netreo",
+    "manageengine": "#ManageEngine",
+}
+
+VENDOR_MIN_MENTIONS = 3
+
+BRAND_TAGS = [
+    (r"netscout", "#NetScout"),
+    (r"ngeniusone", "#nGeniusONE"),
+    (r"infinistream", "#InfiniStream"),
+    (r"nG1", "#nG1"),
+    (r"cyberstream", "#CyberStream"),
+]
 
 
 def load_feed_sources() -> list[tuple[str, str]]:
@@ -762,46 +967,138 @@ MIN_POST_CHARS = int(os.getenv("MIN_POST_CHARS", "350"))
 
 
 def complete_sentence(text: str) -> str:
-    """Drop an incomplete trailing sentence from a body.
+    """Trim a body back to its last complete sentence.
 
     RSS descriptions are often truncated by the publisher, so a body can end
-    mid-clause ("...allows attackers. \"An improper"). Trimming back to the
-    last sentence boundary keeps the published text readable. Only trims when
-    the remaining head is still most of the text, so a short or single-sentence
-    body is left untouched.
+    mid-clause ("...corrupt a program's memory, potentially"). A post ending
+    there reads as broken, so the trailing fragment is dropped instead of
+    published. When no sentence boundary survives, an empty string is
+    returned and the caller skips the story -- a fragment is never published
+    just because it is all that was available.
     """
-    text = text.strip()
-    if not text or text[-1] in '.!?…"”’)':
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if text[-1] in SENTENCE_END:
         return text
     boundary = max(text.rfind(". "), text.rfind("! "), text.rfind("? "))
     if boundary < 0:
-        return text
-    head = text[: boundary + 1].strip()
-    if len(head) >= max(200, int(len(text) * 0.6)):
-        return head
+        return ""
+    return text[: boundary + 1].strip()
+
+
+def apply_inline_tags(text: str, category: str | None = None, title: str = "") -> str:
+    """Put a # in front of important words instead of appending a tag block.
+
+    The tag is only a marker: no hashtag body is added. The important word
+    itself becomes the hashtag ("vulnerabilities" -> "#vulnerabilities"), so
+    the post reads as prose with emphasis rather than as keyword soup glued
+    onto words.
+
+    Selection is capped: the top few patterns for the category are tried in
+    priority order, each word is tagged once, and a post never gets more than
+    MAX_INLINE_TAGS markers.
+
+    Competitor product names go through the subject gate: they are tagged only
+    when the article is about them (name in the title, or VENDOR_MIN_MENTIONS
+    occurrences in the body). A single passing mention is not an endorsement
+    and is left alone. NetScout's own product names skip the gate.
+    """
+    marker = "#"
+
+    def mark(match: re.Match, text: str) -> str | None:
+        before = text[match.start() - 1] if match.start() else " "
+        after = text[match.end()] if match.end() < len(text) else " "
+        if before.isalnum() or before == "_":
+            return None
+        if after.isalnum() or after == "_":
+            return None
+        word = match.group(0)
+        if len(word) < 3:
+            return None
+        return text[: match.start()] + marker + word + text[match.end():]
+
+    used = 0
+    for pattern, _tag in INLINE_TAGS_BY_CATEGORY.get((category or "").lower(), []):
+        if used >= MAX_INLINE_TAGS:
+            break
+        for match in re.finditer(pattern, text, re.I):
+            marked = mark(match, text)
+            if marked is None:
+                continue
+            text = marked
+            used += 1
+            break
+
+    # Competitor product names: subject-gated.
+    for term, _tag in VENDOR_TERMS.items():
+        if used >= MAX_INLINE_TAGS:
+            break
+        mentions = len(re.findall(rf"\b{re.escape(term)}\b", text, re.I))
+        in_title = bool(re.search(rf"\b{re.escape(term)}\b", title or "", re.I))
+        if not (in_title or mentions >= VENDOR_MIN_MENTIONS):
+            continue
+        for match in re.finditer(rf"\b{re.escape(term)}\b", text, re.I):
+            marked = mark(match, text)
+            if marked is None:
+                continue
+            text = marked
+            used += 1
+            break
+
+    # NetScout's own products: no gate, the word appearing is enough.
+    for pattern, _tag in BRAND_TAGS:
+        if used >= MAX_INLINE_TAGS:
+            break
+        for match in re.finditer(pattern, text, re.I):
+            marked = mark(match, text)
+            if marked is None:
+                continue
+            text = marked
+            used += 1
+            break
     return text
 
 
-def build_post(title: str, url: str, domain: str, summary: str) -> str:
-    parts = [complete_sentence(summary) or title.strip()]
+def build_post(title: str, url: str, domain: str, summary: str, category: str | None = None) -> str:
+    """Assemble the published text: tagged body, then the source URL.
+
+    A body that does not end on a sentence boundary is a truncated blurb, not
+    an article. Returning an empty string makes the caller skip the story
+    rather than publish two half-sentences.
+    """
+    body = (summary or "").strip()
+    if not body:
+        return ""
+    if body[-1] not in SENTENCE_END:
+        body = complete_sentence(body)
+    if not body or body[-1] not in SENTENCE_END:
+        print(f"refusing incomplete body ({len(body)} chars): {title[:60]!r}", flush=True)
+        return ""
+    body = apply_inline_tags(body, category, title)
+    body = tidy_punctuation(body)
+    parts = [body]
     parts.append(url)
     text = "\n\n".join(p for p in parts if p)
-    if DEFAULT_HASHTAGS and DEFAULT_HASHTAGS.lower() not in text.lower():
-        text = f"{text}\n\n{DEFAULT_HASHTAGS}"
     return text[:2970]
 
 
 def post_is_substantial(text: str, url: str) -> bool:
     """True when a candidate has enough body text to be worth publishing.
 
-    The URL and any hashtag are excluded from the count: they are boilerplate
-    and would let a one-line entry clear the bar.
+    The URL and any hashtags are excluded from the count: they are boilerplate
+    and would let a one-line entry clear the bar. The threshold is a
+    sentence-level minimum, not the old one-line-of-body floor: a post made of
+    two truncated fragments is not substantial even at 400 characters.
     """
+    if not text:
+        return False
     body = text
-    for boilerplate in (url, DEFAULT_HASHTAGS):
+    for boilerplate in (url,):
         if boilerplate:
             body = body.replace(boilerplate, " ")
-    return len(body.strip()) >= MIN_POST_CHARS
+    body = re.sub(r"#\w+", " ", body)
+    return len(body.strip()) >= MIN_POST_BODY_CHARS
 
 
 def html_to_text(raw: str) -> str:
@@ -815,23 +1112,24 @@ def html_to_text(raw: str) -> str:
 def extract_article(raw: str) -> str:
     """Pull the article body out of a page, avoiding nav and boilerplate.
 
-    Tries, in order: og:description, JSON-LD articleBody, the densest <p>
-    cluster, then the whole document as a last resort. The paragraph route is
-    what keeps menu items and breadcrumbs out of the post.
+    Tries, in order: the paragraph cluster (the real body), JSON-LD
+    articleBody, a meta description as a last resort, then the whole document.
+
+    Paragraphs come first deliberately. A meta description is a 100-200
+    character standfirst: fine as a fallback, useless as a post, and it was
+    previously tried first -- so every page that had one returned a blurb no
+    matter how long the article was. The <p> route is also what keeps menu
+    items and breadcrumbs out of the published text.
     """
-    meta = re.search(
-        r'<meta[^>]+(?:property|name)=["\']og:description["\'][^>]*content=["\']([^"\']+)',
-        raw, re.I,
-    )
-    if not meta:
-        meta = re.search(
-            r'<meta[^>]+content=["\']([^"\']{80,})["\'][^>]*(?:property|name)=["\']og:description',
-            raw, re.I,
-        )
-    if meta:
-        candidate = html.unescape(meta.group(1)).strip()
-        if len(candidate) >= 80:
-            return candidate
+    paragraphs = []
+    for match in re.finditer(r"(?is)<p[^>]*>(.*?)</p>", raw):
+        text = html_to_text(match.group(1))
+        if len(text) >= 70:
+            paragraphs.append(text)
+        if sum(len(p) for p in paragraphs) >= 2400:
+            break
+    if paragraphs and sum(len(p) for p in paragraphs) >= 400:
+        return " ".join(paragraphs)
 
     for block in re.findall(r'(?is)<script[^>]+application/ld\+json[^>]*>(.*?)</script>', raw):
         try:
@@ -849,23 +1147,34 @@ def extract_article(raw: str) -> str:
             elif isinstance(node, list):
                 stack.extend(node)
 
-    paragraphs = []
-    for match in re.finditer(r"(?is)<p[^>]*>(.*?)</p>", raw):
-        text = html_to_text(match.group(1))
-        if len(text) >= 70:
-            paragraphs.append(text)
-        if sum(len(p) for p in paragraphs) >= 900:
-            break
-    if paragraphs:
-        return " ".join(paragraphs)
+    # Meta description: a standfirst, not an article. Only useful when
+    # nothing better was found, and the caller's length gate decides whether
+    # it is long enough to publish.
+    meta = re.search(
+        r'<meta[^>]+(?:property|name)=["\']og:description["\'][^>]*content=["\']([^"\']+)',
+        raw,
+        re.I,
+    )
+    if not meta:
+        meta = re.search(
+            r'<meta[^>]+content=["\']([^"\']{80,})["\'][^>]*(?:property|name)=["\']og:description',
+            raw,
+            re.I,
+        )
+    if meta:
+        candidate = html.unescape(meta.group(1)).strip()
+        if len(candidate) >= 80:
+            return candidate
 
     return html_to_text(raw)
 
 
-def summarize(url: str) -> str:
-    """Fetch a story and return a short readable extract.
+def summarize(url: str, limit: int = 900) -> str:
+    """Fetch a story and return a readable extract.
 
     Raises on failure so the caller can fall back to the search snippet.
+    `limit` is the character budget for the extracted body: the daily
+    generator asks for more than the search fallback needs.
     """
     req = urllib.request.Request(
         url,
@@ -878,7 +1187,171 @@ def summarize(url: str) -> str:
     )
     with urllib.request.urlopen(req, timeout=20) as response:
         raw = response.read(600_000).decode(errors="replace")
-    return extract_article(raw)[:900]
+    return extract_article(raw)[:limit]
+
+
+def full_article(url: str) -> str:
+    """Fetch a page and return as much article body as will fit in a post.
+
+    Feed summaries are often truncated at 300-400 characters, which is enough
+    to look like a post and not enough to be one. The page itself carries the
+    rest, so when the feed body is thin this is what supplies the text.
+    """
+    try:
+        return summarize(url, limit=2400)
+    except Exception as exc:
+        print(f"full article fetch failed for {url}: {exc}", flush=True)
+        return ""
+
+
+def article_body(title: str, url: str, feed_body: str) -> str:
+    """Pick the usable body: the feed text when it is substantial, otherwise the page.
+
+    Order matters. A long feed body is already clean and on-topic; fetching the
+    page costs a request and can drag in navigation. A short feed body is a
+    standfirst, so the page is the only place the article exists.
+    """
+    body = (feed_body or "").strip()
+    if len(body) >= MIN_FEED_BODY_CHARS:
+        return body
+    page = full_article(url)
+    if len(page) > len(body):
+        print(f"feed body {len(body)} chars, page body {len(page)} chars: {url}", flush=True)
+        return page
+    return body
+
+
+SUMMARY_PROMPT = """You are writing a LinkedIn post for a network engineer who works at NetScout.
+
+Summarise the article below in your own words.
+
+HARD RULES:
+- Do not copy any sentence from the article. Paraphrase everything.
+- {min_chars} to {max_chars} characters. Never exceed {max_chars}.
+- 3 to 5 sentences of plain prose. No bullets, no headings, no hashtags, no links.
+- Sentence 1: what actually happened.
+- The second-to-last sentence must state the concrete consequence (who is at risk,
+  what an attacker can do, what breaks). Not a lesson.
+- BANNED phrases: "highlights the importance of", "underscores", "serves as a
+  reminder", "it is crucial", "in today's landscape", "critical importance",
+  "robust", "leverage", "delve into", "landscape".
+- Do not tell the reader to care. State facts.
+- Do not invent facts that are not in the article.
+
+TITLE: {title}
+
+ARTICLE:
+{body}
+
+POST:"""
+
+
+def _call_model(url: str, model: str, prompt: str) -> str:
+    """One non-streaming generate call to an Ollama-compatible endpoint."""
+    payload = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        # Reasoning models (deepseek:cloud) otherwise spend the whole token
+        # budget thinking out loud and expose the scratchpad as the answer.
+        # think=False makes them return only the finished text.
+        "think": False,
+        "options": {"temperature": 0.4, "num_predict": 600},
+    }).encode()
+    request = urllib.request.Request(
+        f"{url}/api/generate",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(request, timeout=SUMMARY_TIMEOUT) as response:
+        data = json.loads(response.read())
+    # Some cloud models emit reasoning in `thinking` and the answer in
+    # `response`; others put everything in `response`.
+    # Only `response` is the answer. `thinking` is the model's scratchpad and
+    # is never publishable, so an empty response is a failure, not a fallback.
+    text = (data.get("response") or "").strip()
+    if not text and data.get("thinking"):
+        print(f"{model} returned reasoning but no answer", flush=True)
+    return text
+
+
+def summarize_for_post(title: str, url: str, body: str, longer: bool = False) -> str:
+    """Write an original summary of the article for the post body.
+
+    Tries SUMMARY_MODELS in order and returns the first usable result. Returns
+    an empty string when every model fails or the output cannot be cleaned
+    into a post: the caller then skips the story rather than publishing the
+    article text verbatim, which is the failure this exists to prevent.
+
+    `longer` asks for a fuller summary on a retry. A summary that came back
+    too short to satisfy the post length gate is a request for more detail,
+    not a failed story.
+    """
+    if not SUMMARY_ENABLED or not body:
+        return ""
+    floor = SUMMARY_MIN_CHARS
+    if longer:
+        floor = max(SUMMARY_MIN_CHARS, int(SUMMARY_MIN_CHARS * 1.6))
+    prompt = SUMMARY_PROMPT.format(
+        min_chars=floor,
+        max_chars=SUMMARY_MAX_CHARS,
+        title=title,
+        body=body[:4000],
+    )
+    if longer:
+        prompt += (
+            "\n\nThe previous attempt was too short to publish. Expand it with the "
+            f"details that matter, staying at {floor}-{SUMMARY_MAX_CHARS} characters."
+        )
+    for url_base, model in SUMMARY_MODELS:
+        raw = ""
+        for attempt in range(2):
+            ask = prompt
+            if attempt:
+                ask = prompt + (
+                    "\n\nYour previous attempt used banned filler. Rewrite it and do not use "
+                    "any of these phrases: " + "; ".join(BANNED_PHRASES[:12]) + "."
+                )
+            try:
+                raw = _call_model(url_base, model, ask)
+            except Exception as exc:
+                print(f"summary model {model} failed: {exc}", flush=True)
+                raw = ""
+                break
+            if not raw:
+                continue
+            cleaned = re.sub(r"\s+", " ", raw).strip().lower()
+            hits = [phrase for phrase in BANNED_PHRASES if phrase in cleaned]
+            if not hits:
+                break
+            print(f"summary model {model} used banned filler on attempt {attempt + 1}: {hits}", flush=True)
+            raw = ""
+        if not raw:
+            print(f"summary model {model} produced nothing usable", flush=True)
+            continue
+        text = re.sub(r"\s+", " ", raw).strip()
+        # Strip a leading "POST:" or a trailing URL the model invented.
+        text = re.sub(r"^(POST|SUMMARY)\s*:\s*", "", text, flags=re.I).strip()
+        text = re.sub(r"https?://\S+", "", text).strip()
+        text = re.sub(r"#\w+", "", text).strip()
+        if len(text) < SUMMARY_MIN_CHARS:
+            print(f"summary model {model} too short ({len(text)} chars)", flush=True)
+            continue
+        if len(text) > SUMMARY_MAX_CHARS:
+            cut = text[: SUMMARY_MAX_CHARS]
+            boundary = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+            text = cut[: boundary + 1].strip() if boundary > 0 else ""
+            if not text:
+                print(f"summary model {model} could not be trimmed", flush=True)
+                continue
+        if text[-1] not in SENTENCE_END:
+            text = complete_sentence(text)
+        if len(text) < SUMMARY_MIN_CHARS:
+            continue
+        print(f"summary from {model}: {len(text)} chars for {url}", flush=True)
+        return text
+    print(f"all summary models failed for {url}; skipping story", flush=True)
+    return ""
 
 
 def is_promotional(title: str, body: str) -> bool:
@@ -973,23 +1446,37 @@ def generate_daily_post() -> None:
             # Bucket by relevance so recency only breaks ties within a bucket.
             return (rel, ts)
         items.sort(key=rank, reverse=True)
-        story = items[0]
-        url = story["url"].strip()
-        domain = story_domain(url)
-        title = (story.get("title") or "").strip()
-        body = (story.get("summary") or "").strip()
-        if not body:
-            try:
-                body = summarize(url)
-            except Exception as exc:
-                print(f"summary fetch failed for {url}: {exc}", flush=True)
-                body = title
-        if is_promotional(title, body):
-            print(f"skipping {url}: promotional, not reporting", flush=True)
-            continue
-        text = build_post(title, url, domain, body)
-        if not post_is_substantial(text, url):
-            print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
+        # Walk the ranked list until one candidate passes. Rejecting a story is
+        # a reason to try the next one, not to abandon the day: a category with
+        # twenty unseen items should yield a post even when the top picks are
+        # promotional or too thin.
+        for story in items[:MAX_CANDIDATES_PER_CATEGORY]:
+            url = story["url"].strip()
+            domain = story_domain(url)
+            title = (story.get("title") or "").strip()
+            body = article_body(title, url, story.get("summary") or "")
+            if len(body) < MIN_FEED_BODY_CHARS:
+                print(f"skipping {url}: body only {len(body)} chars after page fetch", flush=True)
+                continue
+            if is_promotional(title, body):
+                print(f"skipping {url}: promotional, not reporting", flush=True)
+                continue
+            text = ""
+            for attempt in range(SUMMARY_RETRIES + 1):
+                summary = summarize_for_post(title, url, body, longer=attempt > 0)
+                if not summary:
+                    break
+                text = build_post(title, url, domain, summary, category)
+                if post_is_substantial(text, url):
+                    break
+                print(f"summary short ({len(text)} chars), retrying {url} attempt {attempt + 2}", flush=True)
+                text = ""
+            if not text:
+                print(f"skipping {url}: no post that clears the length gate", flush=True)
+                continue
+            break
+        else:
+            # Every candidate in this category failed; move to the next category.
             continue
         scheduled = moment.replace(hour=due_hour(moment), minute=0, second=0, microsecond=0)
         post_id = queue_post(text, int(scheduled.timestamp()))
@@ -1017,17 +1504,18 @@ def generate_daily_post() -> None:
         url = story["url"].strip()
         domain = story_domain(url)
         title = (story.get("title") or "").strip()
-        try:
-            body = summarize(url)
-        except Exception as exc:
-            body = (story.get("content") or "").strip()
-            print(f"summary fetch failed for {url}: {exc}; using search snippet", flush=True)
-        if not body:
-            body = title
+        body = article_body(title, url, story.get("content") or "")
+        if len(body) < MIN_FEED_BODY_CHARS:
+            print(f"skipping {url}: body only {len(body)} chars after page fetch", flush=True)
+            continue
         if is_promotional(title, body):
             print(f"skipping {url}: promotional, not reporting", flush=True)
             continue
-        text = build_post(title, url, domain, body)
+        summary = summarize_for_post(title, url, body)
+        if not summary:
+            print(f"skipping {url}: no usable summary", flush=True)
+            continue
+        text = build_post(title, url, domain, summary, topic)
         if not post_is_substantial(text, url):
             print(f"skipping {url}: only {len(text)} chars, below MIN_POST_CHARS={MIN_POST_CHARS}", flush=True)
             continue
@@ -1047,11 +1535,15 @@ def generate_daily_post() -> None:
 
 
 def normalized_text(text: str) -> str:
+    """Validate a manual post. No hashtags are appended any more.
+
+    Hand-written posts carry whatever tags the author put inline. The brand
+    tag is never added automatically: it belongs in a post only when the
+    article actually mentions the word.
+    """
     text = text.strip()
-    if DEFAULT_HASHTAGS and DEFAULT_HASHTAGS.lower() not in text.lower():
-        text = f"{text}\n\n{DEFAULT_HASHTAGS}"
     if not text or len(text) > 3000:
-        raise ValueError("Post text must contain 1 to 3,000 characters after hashtags are added")
+        raise ValueError("Post text must contain 1 to 3,000 characters")
     return text
 
 

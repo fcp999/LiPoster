@@ -6,7 +6,8 @@ A small, single-user LinkedIn text-post scheduler. It publishes directly through
 
 - Immediate and scheduled text posts
 - LinkedIn OAuth 2.0
-- Automatic `#NetScout` suffix
+- Hashtags inline on key terms; the brand tag only when the word appears
+- Original summaries with the source URL as attribution
 - SQLite audit trail
 - Duplicate-safe failure handling for ambiguous POST results
 - Browser interface and bearer-token REST API
